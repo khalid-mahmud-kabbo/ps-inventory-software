@@ -855,36 +855,37 @@ public function datatableListLedger(Request $request)
     $bankFlow = (clone $baseQuery)->where(fn($q) => $q->whereNotIn('payment_type_id', [$cashId, $chequeId])->orWhereNotIn('transfer_to_payment_type_id', [$cashId, $chequeId]))
         ->when($partyId || $partyType, $partyFilter)->get()->map(fn($row) => tap($row, fn(&$r) => $r->flow_type = 'bank'));
 
-    // --- 2. FETCH AND FORMAT PARTY OPENING DATAS ---
-   // --- 2. FETCH AND FORMAT PARTY OPENING DATAS ---
-$openingTransactions = PartyTransaction::with('party')
-    ->where('transaction_type', 'Party Opening')
-    ->when($partyId, fn($q) => $q->where('party_id', $partyId))
-    ->when($fromDate, fn($q) => $q->where('transaction_date', '>=', $fromDate))
-    ->when($toDate, fn($q) => $q->where('transaction_date', '<=', $toDate))
-    ->get()
-    ->map(function($row) {
-        return (object) [
-            'id'                   => $row->id,
-            'transaction_date'     => $row->transaction_date,
-            'created_at'           => $row->created_at,
-            'transaction_type'     => 'Party Opening',
-            'flow_type'            => 'Opening',
-            'amount'               => (float)$row->to_receive > 0 ? (float)$row->to_receive : (float)$row->to_pay,
-            'type_of_payment'      => (float)$row->to_receive > 0 ? 'receive' : 'pay',
-            'invoice_or_bill_code' => 'Opening Balance',
-            'transaction'          => (object) ['party' => $row->party, 'grand_total' => 0],
-            'is_opening_type'      => true
-        ];
-    });
+    // --- 2. FETCH PARTY OPENING DATAS ---
+    $openingTransactions = PartyTransaction::with('party')
+        ->where('transaction_type', 'Party Opening')
+        ->when($partyId, fn($q) => $q->where('party_id', $partyId))
+        ->when($fromDate, fn($q) => $q->where('transaction_date', '>=', $fromDate))
+        ->when($toDate, fn($q) => $q->where('transaction_date', '<=', $toDate))
+        ->get()
+        ->map(function($row) {
+            $toRec = (float)$row->to_receive;
+            $toPay = (float)$row->to_pay;
+            return (object) [
+                'id'                   => $row->id,
+                'transaction_date'     => $row->transaction_date,
+                'created_at'           => $row->created_at,
+                'transaction_type'     => 'Party Opening',
+                'flow_type'            => 'Opening',
+                'amount'               => $toRec > 0 ? $toRec : $toPay,
+                'type_of_payment'      => $toRec > 0 ? 'receive' : 'pay',
+                'invoice_or_bill_code' => 'Opening Balance',
+                'transaction'          => (object) ['party' => $row->party, 'grand_total' => 0],
+                'is_opening_type'      => true
+            ];
+        });
 
-// FIX: Convert to base collection using ->toBase() or collect() to avoid getKey() error
-$transactions = collect([])
-    ->merge($cashFlow->toBase())
-    ->merge($bankFlow->toBase())
-    ->merge($openingTransactions->toBase())
-    ->sortBy(fn($row) => $row->transaction_date . ' ' . $row->created_at)
-    ->values();
+    // Merge using toBase() to prevent stdClass::getKey() error
+    $transactions = collect([])
+        ->merge($cashFlow->toBase())
+        ->merge($bankFlow->toBase())
+        ->merge($openingTransactions->toBase())
+        ->sortBy(fn($row) => $row->transaction_date . ' ' . $row->created_at)
+        ->values();
 
     // --- 3. PROCESSING LOOP ---
     $finalPartyLedgerBalance = null;
@@ -893,9 +894,11 @@ $transactions = collect([])
 
     $transactions = $transactions->map(function ($row) use (&$finalPartyLedgerBalance, &$finalBalanceStatus, &$finalBalanceClass, $dangerTypes, $partyId) {
         
+        $isOpening = isset($row->is_opening_type);
+
         // Determine Cash In/Out
         $isCashIn = true;
-        if (isset($row->is_opening_type)) {
+        if ($isOpening) {
             $isCashIn = ($row->type_of_payment === 'receive');
         } else {
             if (!empty($row->type_of_payment)) {
@@ -906,12 +909,15 @@ $transactions = collect([])
             }
         }
 
-        $row->cash_in = $isCashIn ? $row->amount : 0;
-        $row->cash_out = !$isCashIn ? $row->amount : 0;
+        // Move opening amount to name, keep columns 0
+        $row->cash_in  = (!$isOpening && $isCashIn) ? $row->amount : 0;
+        $row->cash_out = (!$isOpening && !$isCashIn) ? $row->amount : 0;
         $row->grandTotal = $row->transaction->grand_total ?? 0;
 
-        // Balance Logic
-        if ($row->transaction_type === 'Sale' || $row->transaction_type === 'Purchase') {
+        // Row Balance
+        if ($isOpening) {
+            $row->balance = 0; 
+        } elseif ($row->transaction_type === 'Sale' || $row->transaction_type === 'Purchase') {
             $row->balance = $row->grandTotal - ($isCashIn ? $row->cash_in : $row->cash_out);
         } else {
             $row->balance = $row->cash_in - $row->cash_out;
@@ -920,9 +926,13 @@ $transactions = collect([])
         // Party Name Formatting
         $party = $row->transaction->party ?? null;
         if ($party) {
-            $type = ucfirst($party->party_type);
-            $suffix = isset($row->is_opening_type) ? ' (Opening)' : '';
-            $row->party_name = "{$type} : {$party->getFullName()}{$suffix}";
+            $typeStr = ucfirst($party->party_type);
+            if ($isOpening) {
+                $formattedOpening = $this->formatWithPrecision($row->amount, comma: true);
+                $row->party_name = "{$typeStr} : {$party->getFullName()} (Opening: {$formattedOpening})";
+            } else {
+                $row->party_name = "{$typeStr} : {$party->getFullName()}";
+            }
             
             if ($partyId && $party->id == $partyId) {
                 $balanceData = $this->partyService->getPartyBalance([$party->id]);
@@ -936,18 +946,18 @@ $transactions = collect([])
 
         // Products and Invoice
         $row->products = '';
-        if (!isset($row->is_opening_type) && $row->transaction && method_exists($row->transaction, 'itemTransaction')) {
+        if (!$isOpening && $row->transaction && method_exists($row->transaction, 'itemTransaction')) {
             $row->products = $row->transaction->itemTransaction->map(fn($it) => ($it->item?->name ?? 'Item') . " ($it->quantity)")->implode('<br>');
         }
         
-        $invoice = (isset($row->is_opening_type)) ? 'Opening' : (method_exists($row->transaction, 'getTableCode') ? $row->transaction->getTableCode() : '');
+        $invoice = $isOpening ? 'Opening' : (method_exists($row->transaction, 'getTableCode') ? $row->transaction->getTableCode() : '');
         $row->invoice_or_bill_code = $invoice . ($row->products ? '<br>' . $row->products : '');
         $row->transaction_details = $row->transaction_type;
 
         return $row;
     });
 
-    // Reverse for Datatables (Recent first)
+    // Reverse for Datatables (Recent transactions at the top)
     $transactions = $transactions->reverse()->values();
 
     // --- 4. RETURN DATATABLES ---
